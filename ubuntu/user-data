@@ -1,0 +1,250 @@
+#cloud-config
+autoinstall:
+  version: 1
+  interactive-sections:
+    - identity
+  early-commands:
+    - dd if=/dev/urandom of=/run/cryptroot.key bs=1024 count=8
+  keyboard:
+    layout: us
+  locale: en_US.UTF-8
+  timezone: Europe/Berlin
+  updates: all
+  ssh:
+    authorized-keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFs5P0QsFyc2ky1FFnAEdx/UYvHcfdvxQDkk0GOoFHTG kontextwechsel@github.com
+    install-server: true
+  storage:
+    swap:
+      size: 0
+    config:
+      - id: disk
+        type: disk
+        ptable: gpt
+        wipe: superblock-recursive
+        grub_device: true
+
+      - id: efi-partition
+        type: partition
+        number: 1
+        device: disk
+        size: 1G
+        flag: boot
+        grub_device: true
+      - id: efi-filesystem
+        type: format
+        volume: efi-partition
+        fstype: fat32
+        label: EFI
+      - id: efi-mount
+        type: mount
+        device: efi-filesystem
+        path: /boot/efi
+
+      - id: root-partition
+        type: partition
+        number: 2
+        device: disk
+        size: 4G
+      - id: cryptroot
+        type: dm_crypt
+        volume: root-partition
+        name: cryptroot
+        keyfile: /run/cryptroot.key
+      - id: root-filesystem
+        type: format
+        volume: cryptroot
+        fstype: ext4
+        label: SYSTEM
+      - id: root-mount
+        type: mount
+        device: root-filesystem
+        path: /
+
+      - id: boot-partition
+        type: partition
+        number: 3
+        device: disk
+        size: 1G
+      - id: boot-filesystem
+        type: format
+        volume: boot-partition
+        fstype: ext4
+        label: BOOT
+      - id: boot-mount
+        type: mount
+        device: boot-filesystem
+        path: /boot
+
+  late-commands:
+    - test -d /sys/firmware/efi/
+
+    - |
+      tee /run/remove-cloud-init <<- EOF
+      	rm --recursive /run/cloud-init/
+      	find /etc/cloud/cloud.cfg.d/ -type f -iname "*dpkg*" -delete
+      	cloud-init init
+      	cloud-init modules --mode=config
+
+      	apt-get --yes purge \$(dpkg-query --showformat='\${Package} \${db:Status-Abbrev}\n' --show "*cloud*" "*landscape*" "*netplan*" "*plymouth*" | awk '\$2 == "ii" { print \$1 }')
+
+      	rm --recursive /etc/cloud/
+      	rm --recursive /etc/netplan/
+      	rm --recursive /var/lib/cloud/
+      	rm --recursive /usr/share/netplan/
+      	find /etc/ssh/sshd_config.d/ -type f -delete
+
+      	interface="\$(ip route | awk '\$1 == "default" { print \$5 }')"
+      	tee "/etc/systemd/network/10-\${interface}.network" << IEOF
+      		[Match]
+      		Name=\${interface}
+
+      		[Network]
+      		DHCP=yes
+      	IEOF
+      EOF
+    - curtin in-target --target=/target/ -- bash -e /run/remove-cloud-init
+
+    - |
+      tee /run/remove-packages <<- EOF
+      	apt-get --yes purge \$(dpkg-query --showformat='\${Package} \${db:Status-Abbrev}\n' --show "*command-not-found*" "*modem*" "*multipath*" | awk '\$2 == "ii" { print \$1 }')
+      EOF
+    - curtin in-target --target=/target/ -- bash -e /run/remove-packages
+
+    - |
+      tee /run/move-boot-files <<- EOF
+      	efi="\$(findmnt --noheadings --output SOURCE --first-only /target/boot/efi/)"
+      	boot="\$(findmnt --noheadings --output SOURCE --first-only /target/boot/)"
+
+      	find /target/boot/efi/ -mindepth 1 -delete
+      	umount /target/boot/efi/
+      	find /target/boot/ -mindepth 1 ! \( -type f -a \( -iname "vmlinuz-*" -o -iname "config-*" -o -iname "system.map-*" \) \) -delete
+      	umount /target/boot/
+
+      	mount "\${boot}" /mnt/
+      	rsync --archive --remove-source-files /mnt/ /target/boot/
+      	umount /mnt/
+
+      	mkdir /target/boot/efi/
+      	mount "\${efi}" /target/boot/efi/
+
+      	disk="\$(lsblk --noheadings --output PKNAME --paths "\${efi}")"
+
+      	parted "\${disk}" --script rm 3
+      EOF
+    - bash -e /run/move-boot-files
+
+    - |
+      tee /run/install-dracut <<- EOF
+      	apt-get --yes install dracut systemd-boot-efi
+      	apt-get --yes --allow-remove-essential purge \$(dpkg-query --showformat='\${Package} \${db:Status-Abbrev}\n' --show "*initramfs*" "*grub*" "*shim*" "*recovery*" | awk '\$2 == "ii" { print \$1 }')
+
+      	rm --recursive /etc/grub.d/
+      	rm --recursive /var/lib/grub/
+      	rm --recursive /usr/lib/shim/
+      	find /boot/ -type f -iname "initrd*" -delete
+      	find /etc/default/ -type f -iname "*grub*" -delete
+      	find /etc/alternatives/ -type f -iname "*shim*" -delete
+      	find /var/lib/dpkg/alternatives/ -type f -iname "*shim*" -delete
+
+      	efi="\$(findmnt --noheadings --output UUID --first-only /boot/efi/)"
+      	cryptroot="\$(blkid --match-tag UUID --output value "\$(cryptsetup status cryptroot | awk '\$1 == "device:" {print \$2}')")"
+      	root="\$(findmnt --noheadings --output UUID --first-only /)"
+
+      	mkdir /etc/cryptsetup/
+      	cp /run/cryptroot.key /etc/cryptsetup/cryptroot.key
+      	chmod u=r,go= /etc/cryptsetup/cryptroot.key
+
+      	tee /etc/dracut.conf << IEOF
+      		hostonly="yes"
+      		uefi="yes"
+      	IEOF
+      	tee /etc/dracut.conf.d/cmdline.conf << IEOF
+      		kernel_cmdline="rd.luks.uuid=\${cryptroot} rd.luks.key=/etc/cryptsetup/cryptroot.key rd.luks.options=discard root=UUID=\${root} quiet"
+      	IEOF
+      	tee /etc/dracut.conf.d/cryptroot.conf << IEOF
+      		install_items+=" /etc/cryptsetup/cryptroot.key "
+      	IEOF
+
+      	tee /etc/kernel/postinst.d/dracut << IEOF
+      		#!/bin/sh
+
+      		if [ -n "\\\$1" ]; then
+      		  dracut --force /boot/efi/EFI/BOOT/BOOTX64.EFI "\\\$1"
+      		fi
+      	IEOF
+      	tee /etc/kernel/postrm.d/dracut << IEOF
+      		#!/bin/sh
+      	IEOF
+
+      	tee /etc/kernel-img.conf << IEOF
+      		link_in_boot = 0
+      	IEOF
+
+      	tee /etc/fstab << IEOF
+      		UUID=\${root} / ext4 defaults 0 1
+      		UUID=\${efi} /boot/efi vfat defaults 0 1
+      	IEOF
+      	tee /etc/crypttab << IEOF
+      		cryptroot UUID=\${cryptroot} /etc/cryptsetup/cryptroot.key luks,discard
+      	IEOF
+
+      	mkdir --parents /boot/efi/EFI/BOOT/
+      	dracut --force /boot/efi/EFI/BOOT/BOOTX64.efi "\$(ls -1 /lib/modules/)"
+
+      	while IFS= read -r n;
+      	  do efibootmgr --bootnum "\$n" --delete-bootnum
+      	done < <(efibootmgr | grep --only-matching --perl-regexp "(?<=Boot)[0-9]+(?=[*])")
+      EOF
+    - curtin in-target --target=/target/ -- bash -e /run/install-dracut
+
+    - |
+      tee /run/add-scripts <<- EOF
+      	disk="\$(lsblk --noheadings --output PKNAME --paths "\$(findmnt --noheadings --output SOURCE --first-only /boot/efi/)")"
+      	partition="\$(cryptsetup status cryptroot | awk '\$1 == "device:" {print \$2}')"
+      	user="\$(getent passwd 1000 | awk --field-separator=: ' {print \$1 }')"
+
+      	file="/home/\${user}/remove-cryptkey"
+      	tee "\${file}" << IEOF
+      		#!/bin/bash
+
+      		sudo cryptsetup luksChangeKey \${partition} --key-file /etc/cryptsetup/cryptroot.key
+
+      		sudo cryptsetup reencrypt \${partition}
+
+      		sudo rm --recursive /etc/cryptsetup/
+      		sudo rm /etc/dracut.conf.d/cryptroot.conf
+
+      		sudo sed --in-place --regexp-extended "s# /etc/cryptsetup/cryptroot.key # none #g" /etc/crypttab
+      		sudo sed --in-place --regexp-extended "s# rd.luks.key=/etc/cryptsetup/cryptroot.key # #g" /etc/dracut.conf.d/cmdline.conf
+
+      		sudo dracut --force /boot/efi/EFI/BOOT/BOOTX64.efi
+      	IEOF
+      	chown "\${user}:\${user}" "\${file}"
+      	chmod u=rwx,go=rx "\${file}"
+
+      	file="/home/\${user}/resize-partition"
+      	tee "\${file}" << IEOF
+      		#!/bin/bash
+
+      		sudo parted "\${disk}" --script resizepart 2 100%
+
+      		if [[ -f /etc/cryptsetup/cryptroot.key ]]; then
+      		  sudo cryptsetup resize cryptroot --key-file /etc/cryptsetup/cryptroot.key
+      		else
+      		  sudo cryptsetup resize cryptroot
+      		fi
+
+      		sudo resize2fs /dev/mapper/cryptroot
+      	IEOF
+      	chown "\${user}:\${user}" "\${file}"
+      	chmod u=rwx,go=rx "\${file}"
+      EOF
+    - curtin in-target --target=/target/ -- bash -e /run/add-scripts
+
+    - |
+      tee /run/purge-packages <<- EOF
+      	apt-get --yes autoremove
+      	apt-get --yes purge \$(dpkg-query --showformat='\${Package} \${db:Status-Abbrev}\n' --show | awk '\$2 == "rc" { print \$1 }')
+      EOF
+    - curtin in-target --target=/target/ -- bash -e /run/purge-packages
