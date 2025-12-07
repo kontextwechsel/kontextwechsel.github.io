@@ -20,6 +20,8 @@ autoinstall:
     config:
       - id: disk
         type: disk
+        match:
+          is_empty: true
         ptable: gpt
         wipe: superblock-recursive
         grub_device: true
