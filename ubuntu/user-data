@@ -21,10 +21,8 @@ autoinstall:
       - id: disk
         type: disk
         match:
-          is_empty: true
+          size: largest
         ptable: gpt
-        wipe: superblock-recursive
-        grub_device: true
 
       - id: efi-partition
         type: partition
@@ -201,48 +199,54 @@ autoinstall:
     - curtin in-target --target=/target/ -- bash -e /run/install-dracut
 
     - |
-      tee /run/add-scripts <<- EOF
+      tee /run/add-resize-script <<- EOF
       	disk="\$(lsblk --noheadings --output PKNAME --paths "\$(findmnt --noheadings --output SOURCE --first-only /boot/efi/)")"
       	partition="\$(cryptsetup status cryptroot | awk '\$1 == "device:" {print \$2}')"
       	user="\$(getent passwd 1000 | awk --field-separator=: ' {print \$1 }')"
 
-      	file="/home/\${user}/remove-cryptkey"
+      	file="/usr/local/bin/do-partition-resize"
       	tee "\${file}" << IEOF
       		#!/bin/bash
 
-      		sudo cryptsetup luksChangeKey \${partition} --key-file /etc/cryptsetup/cryptroot.key
+      		set -e
 
-      		sudo cryptsetup reencrypt \${partition}
-
-      		sudo rm --recursive /etc/cryptsetup/
-      		sudo rm /etc/dracut.conf.d/cryptroot.conf
-
-      		sudo sed --in-place --regexp-extended "s# /etc/cryptsetup/cryptroot.key # none #g" /etc/crypttab
-      		sudo sed --in-place --regexp-extended "s# rd.luks.key=/etc/cryptsetup/cryptroot.key # #g" /etc/dracut.conf.d/cmdline.conf
-
-      		sudo dracut --force /boot/efi/EFI/BOOT/BOOTX64.efi
-      	IEOF
-      	chown "\${user}:\${user}" "\${file}"
-      	chmod u=rwx,go=rx "\${file}"
-
-      	file="/home/\${user}/resize-partition"
-      	tee "\${file}" << IEOF
-      		#!/bin/bash
-
-      		sudo parted "\${disk}" --script resizepart 2 100%
-
-      		if [[ -f /etc/cryptsetup/cryptroot.key ]]; then
-      		  sudo cryptsetup resize cryptroot --key-file /etc/cryptsetup/cryptroot.key
-      		else
-      		  sudo cryptsetup resize cryptroot
+      		if [ "\\\${EUID}" -ne 0 ]; then
+      		  printf "Please run as administrator\n"
+      		  exit 1
       		fi
 
-      		sudo resize2fs /dev/mapper/cryptroot
+      		read -r -p "Replace encryption key with passphrase? [y/N] "
+      		if [[ "\\\${REPLY}" =~ ^[Yy]$ ]]; then
+      		  read -s -p "Please enter passphrase: " passphrase
+      		  printf "\n"
+
+      		  cryptsetup luksChangeKey \${partition} --key-file /etc/cryptsetup/cryptroot.key < <(printf "%s\n" "\\\${passphrase}" "\\\${passphrase}")
+      		  cryptsetup reencrypt \${partition} < <(printf "%s\n" "\\\${passphrase}")
+
+      		  rm --recursive /etc/cryptsetup/
+      		  rm /etc/dracut.conf.d/cryptroot.conf
+
+      		  sed --in-place --regexp-extended "s# /etc/cryptsetup/cryptroot.key # none #g" /etc/crypttab
+      		  sed --in-place --regexp-extended "s# rd.luks.key=/etc/cryptsetup/cryptroot.key # #g" /etc/dracut.conf.d/cmdline.conf
+
+      		  dracut --force /boot/efi/EFI/BOOT/BOOTX64.efi
+      		fi
+
+      		parted \${disk} --script resizepart 2 100%
+
+      		if [ -z "\\\${passphrase+substitution}" ]; then
+      		  cryptsetup resize cryptroot --key-file /etc/cryptsetup/cryptroot.key
+      		else
+      		  cryptsetup resize cryptroot < <(printf "%s\n" "\\\${passphrase}")
+      		fi
+
+      		resize2fs /dev/mapper/cryptroot
+
+      		rm -- "\\\$0"
       	IEOF
-      	chown "\${user}:\${user}" "\${file}"
       	chmod u=rwx,go=rx "\${file}"
       EOF
-    - curtin in-target --target=/target/ -- bash -e /run/add-scripts
+    - curtin in-target --target=/target/ -- bash -e /run/add-resize-script
 
     - |
       tee /run/purge-packages <<- EOF
